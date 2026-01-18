@@ -1,0 +1,471 @@
+"""
+模型管理模块
+负责模型下载、加载和推理
+"""
+
+import os
+import json
+import re
+from datetime import datetime
+import traceback
+import torch
+import logging
+from pathlib import Path
+from typing import List, Dict, Any, Optional
+from transformers import (
+    AutoTokenizer, 
+    AutoModel, 
+    AutoModelForCausalLM,
+    pipeline
+)
+from sentence_transformers import SentenceTransformer
+import faiss
+import numpy as np
+
+# 使用配置实例，但避免循环导入问题
+import os
+import sys
+sys.path.append(os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
+from config.config import Config
+
+# 创建配置实例但使用后续传递的方式
+_global_config = None
+
+def set_config(config_instance):
+    """设置全局配置实例"""
+    global _global_config
+    _global_config = config_instance
+    
+def get_config():
+    """获取全局配置实例"""
+    return _global_config
+
+logger = logging.getLogger(__name__)
+
+class LocalVulnerabilityDetector:
+    """本地漏洞检测器"""
+    
+    def __init__(self, config: Config, model_name: Optional[str] = None, 
+                 embedding_model: Optional[str] = None):
+        """
+        初始化本地模型
+        
+        Args:
+            config: 配置对象
+            model_name: 主要推理模型名称
+            embedding_model: 嵌入模型名称  
+        """
+        self.config = config
+        self.model_name = model_name or config.model_name
+        self.embedding_model = embedding_model or config.embedding_model
+        self.device = config.device
+        
+        # 初始化组件
+        self.tokenizer = None
+        self.model = None
+        self.embedding_model_obj = None
+        self.faiss_index = None
+        self.id2text = None
+        self.logs_dir = self.config.logs_dir
+        
+        # 加载模型
+        self._load_models()
+    
+    def _load_models(self):
+        """加载所有必要的模型"""
+        logger.info(f"正在加载主要模型: {self.model_name}")
+        
+        # 加载主要模型和tokenizer
+        try:
+            # 检查模型是否已下载
+            model_path = self.config.get_model_path(self.model_name)
+            
+            if model_path.exists() and list(model_path.iterdir()):
+                logger.info(f"从本地路径加载模型: {model_path}")
+                # Tokenizer不需要use_safetensors参数
+                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+                # 模型加载时优先使用safetensors格式
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    model_path,
+                    use_safetensors=True
+                )
+            else:
+                logger.info(f"从HuggingFace下载模型: {self.model_name}")
+                # Tokenizer不需要use_safetensors参数
+                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                # 模型加载时优先使用safetensors格式
+                self.model = AutoModelForCausalLM.from_pretrained(
+                    self.model_name,
+                    use_safetensors=True
+                )
+                
+                # 保存到本地（使用 safetensors 格式）
+                model_path.mkdir(parents=True, exist_ok=True)
+                self.model.save_pretrained(model_path, safe_serialization=True)
+                self.tokenizer.save_pretrained(model_path)
+                logger.info(f"模型已保存到: {model_path}")
+            
+            # 这两个操作应该在if-else块外面，两个分支都需要执行
+            self.model.to(self.device)
+            
+            # 添加pad token
+            if self.tokenizer.pad_token is None:
+                self.tokenizer.pad_token = self.tokenizer.eos_token
+                
+        except Exception as e:
+            logger.error(f"加载主要模型失败: {e}")
+            raise
+        
+        # 加载嵌入模型
+        try:
+            logger.info(f"正在加载嵌入模型: {self.embedding_model}")
+            self.embedding_model_obj = SentenceTransformer(self.embedding_model)
+        except Exception as e:
+            logger.error(f"加载嵌入模型失败: {e}")
+            logger.warning("将使用备用嵌入模型: all-MiniLM-L6-v2")
+            try:
+                # 尝试使用更小的模型
+                self.embedding_model_obj = SentenceTransformer("all-MiniLM-L6-v2")
+            except Exception as e2:
+                logger.error(f"备用嵌入模型也加载失败: {e2}")
+                logger.warning("将创建虚拟嵌入模型")
+                self.embedding_model_obj = None
+    
+    def encode_text(self, text: str) -> np.ndarray:
+        """编码文本为向量"""
+        if self.embedding_model_obj is None:
+            logger.warning("嵌入模型未加载，使用随机向量作为替代")
+            # 创建随机向量作为替代
+            if isinstance(text, list):
+                size = len(text)
+            else:
+                size = 1
+            return np.random.randn(size, 384).astype('float32')  # 384维向量
+        
+        try:
+            if isinstance(text, list):
+                embeddings = self.embedding_model_obj.encode(text)
+            else:
+                embeddings = self.embedding_model_obj.encode([text])
+            return embeddings
+        except Exception as e:
+            logger.error(f"文本编码失败: {e}")
+            # 创建随机向量作为替代
+            if isinstance(text, list):
+                size = len(text)
+            else:
+                size = 1
+            return np.random.randn(size, 384).astype('float32')
+    
+    def build_faiss_index(self, texts: List[str]):
+        """构建FAISS索引"""
+        logger.info(f"为 {len(texts)} 个文本构建FAISS索引")
+        
+        # 编码所有文本
+        embeddings = self.encode_text(texts)
+        embeddings = np.array(embeddings, dtype='float32')
+        
+        # 构建索引
+        dimension = embeddings.shape[1]
+        quantizer = faiss.IndexFlatIP(dimension)
+        index = faiss.IndexIVFFlat(quantizer, dimension, 
+                                   min(self.config.faiss_nlist, len(texts)))
+        
+        # 训练索引
+        if len(texts) > 1:
+            index.train(embeddings)
+        
+        # 添加向量
+        ids = np.array(range(len(texts)), dtype='int64')
+        index.add_with_ids(embeddings, ids)
+        index.nprobe = 1  # 设置搜索的cluster数量
+        
+        self.faiss_index = index
+        self.id2text = {idx: text for idx, text in enumerate(texts)}
+        
+        logger.info("FAISS索引构建完成")
+    
+    def search_similar(self, query: str, top_k: int = 5) -> List[Dict[str, Any]]:
+        """搜索相似文本"""
+        if self.faiss_index is None:
+            raise ValueError("请先构建FAISS索引")
+        
+        # 编码查询
+        query_embedding = self.encode_text([query])
+        query_embedding = np.array(query_embedding, dtype='float32')
+        
+        # 搜索
+        scores, indices = self.faiss_index.search(query_embedding, top_k)
+        
+        results = []
+        for score, idx in zip(scores[0], indices[0]):
+            if idx != -1:  # 有效的索引
+                results.append({
+                    'text': self.id2text[idx],
+                    'score': float(score),
+                    'index': int(idx)
+                })
+        
+        return results
+    
+    def generate_prediction(self, prompt: str, max_new_tokens: int = 64) -> str:
+        """使用本地模型生成预测"""
+        try:
+            if not hasattr(self.model, 'generate') or (getattr(self.model.config, 'model_type', '') in ['roberta', 'bert'] and not getattr(self.model.config, 'is_decoder', False)):
+                return self._heuristic_response(prompt)
+            # 编码输入
+            inputs = self.tokenizer(prompt, return_tensors="pt", 
+                                  truncation=True, max_length=self.config.max_length)
+            inputs = {k: v.to(self.device) for k, v in inputs.items()}
+            
+            # 生成
+            with torch.no_grad():
+                outputs = self.model.generate(
+                    **inputs,
+                    max_new_tokens=max_new_tokens,
+                    num_return_sequences=1,
+                    temperature=0.1,
+                    do_sample=False,
+                    pad_token_id=self.tokenizer.eos_token_id
+                )
+            
+            # 解码输出
+            response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+            
+            # 提取模型响应部分
+            if prompt in response:
+                response = response.split(prompt, 1)[1].strip()
+            
+            return response
+            
+        except Exception as e:
+            logger.error(f"生成预测失败: {e}")
+            self._write_error_log("generation_error", e)
+            try:
+                self.model.to("cpu")
+                inputs = self.tokenizer(prompt, return_tensors="pt", truncation=True, max_length=self.config.max_length)
+                with torch.no_grad():
+                    outputs = self.model.generate(
+                        **inputs,
+                        max_new_tokens=max_new_tokens,
+                        num_return_sequences=1,
+                        temperature=0.1,
+                        do_sample=False,
+                        pad_token_id=self.tokenizer.eos_token_id
+                    )
+                response = self.tokenizer.decode(outputs[0], skip_special_tokens=True)
+                if prompt in response:
+                    response = response.split(prompt, 1)[1].strip()
+                return response
+            except Exception as e2:
+                logger.error(f"CPU回退生成失败: {e2}")
+                self._write_error_log("generation_error_cpu_fallback", e2)
+                return self._heuristic_response(prompt)
+
+    def predict_vulnerability(self, prompt: str) -> Dict[str, Any]:
+        try:
+            text = self.generate_prediction(prompt)
+            parsed = None
+            try:
+                if isinstance(text, str):
+                    s = text.strip()
+                    if '{' in s and '}' in s:
+                        i = s.find('{')
+                        j = s.rfind('}')
+                        block = s[i:j+1]
+                        parsed = json.loads(block)
+                    else:
+                        parsed = json.loads(s)
+            except Exception:
+                parsed = None
+            has_vul = False
+            conf = 0.5
+            vtype = "未知"
+            sugg = ""
+            if isinstance(parsed, dict):
+                hv = parsed.get('has_vulnerability')
+                if isinstance(hv, bool):
+                    has_vul = hv
+                elif isinstance(hv, (int, float)):
+                    has_vul = bool(int(hv))
+                elif isinstance(hv, str):
+                    t = hv.strip().lower()
+                    has_vul = t in ('true','是','yes','1') and t not in ('false','否','no','0')
+                c = parsed.get('confidence')
+                try:
+                    conf = float(c)
+                except Exception:
+                    conf = 0.5
+                vt = parsed.get('vulnerability_type')
+                if isinstance(vt, str) and vt.strip():
+                    vtype = vt.strip()
+                sg = parsed.get('suggestion') or parsed.get('explanation') or ""
+                if isinstance(sg, str):
+                    sugg = sg.strip()
+            else:
+                s = (text or "").lower()
+                if ('vulnerable' in s or '漏洞' in s or '不安全' in s) and ('non-vulnerable' not in s and '无漏洞' not in s and '安全' not in s):
+                    has_vul = True
+                m = re.search(r"([01]?\.\d+)", s)
+                if m:
+                    try:
+                        conf = max(0.0, min(1.0, float(m.group(1))))
+                    except Exception:
+                        conf = 0.5
+                for key in ['sql','注入','buffer','溢出','xss','跨站','命令注入','use-after-free','race','越界']:
+                    if key in s:
+                        vtype = key
+                        break
+                sugg = text.strip()
+            return {
+                'has_vulnerability': has_vul,
+                'confidence': float(conf),
+                'vulnerability_type': vtype,
+                'suggestion': sugg
+            }
+        except Exception as e:
+            logger.error(f"预测失败: {e}")
+            self._write_error_log("predict_error", e)
+            return {
+                'has_vulnerability': False,
+                'confidence': 0.0,
+                'vulnerability_type': '未知',
+                'suggestion': ''
+            }
+
+    def _write_error_log(self, name: str, exc: Exception):
+        try:
+            ts = datetime.now().strftime("%Y%m%d_%H%M%S")
+            path = Path(self.logs_dir) / f"{name}_{ts}.txt"
+            Path(self.logs_dir).mkdir(exist_ok=True)
+            details = f"{type(exc).__name__}: {str(exc)}\n\n" + traceback.format_exc()
+            with open(path, 'w', encoding='utf-8') as f:
+                f.write(details)
+        except Exception:
+            pass
+
+    def _heuristic_response(self, prompt: str) -> str:
+        s = prompt.lower()
+        patterns = [
+            'strcpy(', 'strcat(', 'gets(', 'scanf(', 'sprintf(', 'system(', 'popen(', 'eval(', 'exec(',
+            'memcpy(', 'memmove(', 'strncpy(', 'read(', 'write(', 'httponly', 'sanitize'
+        ]
+        risk = any(p in s for p in patterns)
+        conf = 0.7 if risk else 0.3
+        vtype = 'buffer' if any(p in s for p in ['strcpy(', 'gets(', 'memcpy(']) else ('command' if 'system(' in s or 'popen(' in s else ('sql' if 'select' in s and 'where' in s and ('"' in s or "'" in s) else '未知'))
+        resp = {
+            "has_vulnerability": risk,
+            "confidence": conf,
+            "vulnerability_type": vtype,
+            "suggestion": ""
+        }
+        return json.dumps(resp, ensure_ascii=False)
+    
+    def get_vulnerability_prediction(self, code: str, 
+                                   node_info: str = "",
+                                   edge_info: str = "",
+                                   example: str = "",
+                                   use_graph: bool = True) -> str:
+        """获取漏洞预测"""
+        
+        if use_graph and node_info and edge_info:
+            prompt = self.config.prompt_templates["with_graph"].format(
+                node_info=node_info,
+                edge_info=edge_info,
+                example=example
+            )
+        else:
+            prompt = self.config.prompt_templates["basic"]
+        
+        # 组合完整提示
+        full_prompt = f"{code}\n\n{prompt}"
+        
+        # 生成预测
+        prediction = self.generate_prediction(full_prompt)
+        
+        # 简单的结果解析
+        if "vulnerable" in prediction.lower():
+            return "1"  # Vulnerable
+        elif "non-vulnerable" in prediction.lower() or "safe" in prediction.lower():
+            return "0"  # Non-vulnerable
+        else:
+            # 尝试从数字判断
+            if "1" in prediction and prediction.count("1") > prediction.count("0"):
+                return "1"
+            elif "0" in prediction and prediction.count("0") > prediction.count("1"):
+                return "0"
+            else:
+                return "2"  # 不确定
+
+class CodeRetriever:
+    """代码检索器"""
+    
+    def __init__(self, detector: LocalVulnerabilityDetector):
+        self.detector = detector
+        self.examples_cache = {}
+    
+    def get_similar_examples(self, code: str, ast: str, 
+                           top_k: int = 5,
+                           code_weight: float = 0.7,
+                           ast_weight: float = 0.3) -> List[Dict[str, Any]]:
+        """获取相似示例"""
+        
+        # 缓存键
+        cache_key = f"{hash(code)}_{hash(ast)}_{top_k}"
+        if cache_key in self.examples_cache:
+            return self.examples_cache[cache_key]
+        
+        # 搜索代码相似度
+        code_results = self.detector.search_similar(code, top_k * 2)
+        
+        # 计算AST相似度（简化版）
+        results = []
+        for result in code_results[:top_k]:
+            # 简单的AST相似度计算
+            ast_sim = self._calculate_ast_similarity(ast, result['text'])
+            
+            # 综合分数
+            final_score = code_weight * result['score'] + ast_weight * ast_sim
+            
+            results.append({
+                'code': result['text'],
+                'score': final_score,
+                'code_similarity': result['score'],
+                'ast_similarity': ast_sim
+            })
+        
+        # 按分数排序
+        results.sort(key=lambda x: x['score'], reverse=True)
+        results = results[:top_k]
+        
+        # 缓存结果
+        self.examples_cache[cache_key] = results
+        
+        return results
+    
+    def _calculate_ast_similarity(self, ast1: str, code2: str) -> float:
+        """计算AST相似度（简化版）"""
+        try:
+            # 这里实现简化的AST相似度计算
+            # 实际应用中应该使用更复杂的方法
+            words1 = set(ast1.lower().split())
+            words2 = set(code2.lower().split())
+            
+            intersection = words1.intersection(words2)
+            union = words1.union(words2)
+            
+            if len(union) == 0:
+                return 0.0
+            
+            return len(intersection) / len(union)
+            
+        except Exception:
+            return 0.0
+
+def create_detector(config: Config, model_name: Optional[str] = None) -> LocalVulnerabilityDetector:
+    """创建漏洞检测器的工厂函数"""
+    return LocalVulnerabilityDetector(config, model_name)
+
+def create_retriever(detector: LocalVulnerabilityDetector) -> CodeRetriever:
+    """创建代码检索器的工厂函数"""
+    return CodeRetriever(detector)
