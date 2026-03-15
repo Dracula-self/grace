@@ -1,14 +1,11 @@
 #!/usr/bin/env python3
 """
-GRACE项目完整可视化脚本
-包含：
 1. 性能指标可视化
 2. t-SNE/UMAP降维可视化
 3. 梯度激活图（Saliency Map）
 4. Attention权重可视化
 5. 架构流程图
 
-使用方法:
     python visualization.py --all  # 生成所有可视化
     python visualization.py --tsne  # 仅生成t-SNE可视化
     python visualization.py --saliency  # 仅生成梯度激活图

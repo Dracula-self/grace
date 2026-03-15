@@ -1,0 +1,74 @@
+
+一、环境准备
+--------------------------------------------------------------------------------
+1. 安装依赖
+   pip install -r requirements.txt
+2. 首次使用 wandb
+   pip install wandb
+   wandb login
+3. 数据路径
+   默认数据目录: /root/sj-tmp/dataset/
+   若数据在其他路径，请使用 --data-root 指定
+4. DeepSeek API（可选，用于远程推理）
+   export DEEPSEEK_API_KEY=your_api_key
+   # 运行时加 --use-deepseek-api
+二、基础运行方式
+--------------------------------------------------------------------------------
+1. 下载预训练模型
+   python main.py --download-model
+2. 下载数据集
+   python main.py --download-data
+   # 或指定数据集
+   python main.py --download-data --dataset-for-data bigvul
+3. 检查系统状态
+   python main.py --check-status
+三、评估运行方式
+--------------------------------------------------------------------------------
+1. 单数据集评估
+   python main.py --mode eval --dataset bigvul
+   python main.py --mode eval --dataset reveal
+   python main.py --mode eval --dataset devign
+2. 单数据集评估 + wandb 记录
+   python main.py --mode eval --dataset bigvul --wandb
+3. 评估所有数据集
+   python main.py --eval-all
+4. 评估所有数据集 + wandb
+   python main.py --eval-all --wandb
+四、跨项目漏洞检测
+--------------------------------------------------------------------------------
+1. 通过独立脚本运行
+   python run_cross_project.py --data-root /root/sj-tmp/dataset/
+2. 跨项目评估 + 禁用 wandb
+   python run_cross_project.py --no-wandb
+3. 快速测试（每数据集限制样本数）
+   python run_cross_project.py --max-samples 100 --no-wandb
+4. 仅同项目评估
+   python run_cross_project.py --same-only
+5. 仅跨项目评估
+   python run_cross_project.py --cross-only
+6. 通过 main.py 运行跨项目评估
+   python main.py --cross-project
+   python main.py --cross-project --no-wandb
+7. 使用 DeepSeek API 运行
+   export DEEPSEEK_API_KEY=your_api_key
+   python run_cross_project.py --use-deepseek-api --data-root /root/sj-tmp/dataset/
+   python main.py --cross-project --use-deepseek-api
+五、交互式检测
+--------------------------------------------------------------------------------
+   python main.py --mode interactive
+   输入代码片段后按空行结束，输入 quit 或 exit 退出。
+六、自定义参数
+--------------------------------------------------------------------------------
+--data-root /path/to/data    指定数据根目录
+--model-name microsoft/codebert-base    指定模型
+--device cuda                指定设备（cuda/cpu）
+--no-wandb                   禁用 wandb
+--use-deepseek-api           使用 DeepSeek API 推理（需 DEEPSEEK_API_KEY）
+七、输出文件位置
+--------------------------------------------------------------------------------
+outputs/                      评估结果输出目录
+  - all_evaluation_results.json    全数据集评估结果
+  - cross_project_results.json    跨项目评估结果
+  - *metrics*.log                 单次评估日志
+logs/                         日志目录
+================================================================================
