@@ -4,3 +4,12 @@ utils/__pycache__
 .idea
 __pycache__
 logs
+outputs/
+wandb/
+.cursor/
+
+# 本地文档和日志
+创新训练申请书——智能可迁移的跨项目漏洞检测模型.pdf
+修改记录.txt
+reveal_output.log
+readme.md
