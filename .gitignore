@@ -1,5 +1,9 @@
 config/__pycache__
 models/__pycache__
+
+# 预训练模型（运行时自动下载，不提交到仓库）
+models/*
+!models/__init__.py
 utils/__pycache__
 .idea
 __pycache__
@@ -7,6 +11,7 @@ logs
 outputs/
 wandb/
 .cursor/
+models/
 
 # 本地文档和日志
 创新训练申请书——智能可迁移的跨项目漏洞检测模型.pdf

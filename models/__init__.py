@@ -67,56 +67,47 @@ class LocalVulnerabilityDetector:
         self.faiss_index = None
         self.id2text = None
         self.logs_dir = self.config.logs_dir
+        self._use_deepseek_api = getattr(config, 'use_deepseek_api', False) and getattr(config, 'deepseek_api_key', '')
         
-        # 加载模型
+        # 加载模型（API 模式下跳过本地推理模型）
         self._load_models()
     
     def _load_models(self):
         """加载所有必要的模型"""
-        logger.info(f"正在加载主要模型: {self.model_name}")
+        if self._use_deepseek_api:
+            logger.info("使用 DeepSeek API 模式，跳过本地推理模型加载")
+            self.model = None
+            self.tokenizer = None
+        else:
+            logger.info(f"正在加载主要模型: {self.model_name}")
         
-        # 加载主要模型和tokenizer
-        try:
-            # 检查模型是否已下载
-            model_path = self.config.get_model_path(self.model_name)
-            
-            if model_path.exists() and list(model_path.iterdir()):
-                logger.info(f"从本地路径加载模型: {model_path}")
-                # Tokenizer不需要use_safetensors参数
-                self.tokenizer = AutoTokenizer.from_pretrained(model_path)
-                # 模型加载时优先使用safetensors格式
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    model_path,
-                    use_safetensors=True
-                )
-            else:
-                logger.info(f"从HuggingFace下载模型: {self.model_name}")
-                # Tokenizer不需要use_safetensors参数
-                self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
-                # 模型加载时优先使用safetensors格式
-                self.model = AutoModelForCausalLM.from_pretrained(
-                    self.model_name,
-                    use_safetensors=True
-                )
-                
-                # 保存到本地（使用 safetensors 格式）
-                model_path.mkdir(parents=True, exist_ok=True)
-                self.model.save_pretrained(model_path, safe_serialization=True)
-                self.tokenizer.save_pretrained(model_path)
-                logger.info(f"模型已保存到: {model_path}")
-            
-            # 这两个操作应该在if-else块外面，两个分支都需要执行
-            self.model.to(self.device)
-            
-            # 添加pad token
-            if self.tokenizer.pad_token is None:
-                self.tokenizer.pad_token = self.tokenizer.eos_token
-                
-        except Exception as e:
-            logger.error(f"加载主要模型失败: {e}")
-            raise
+        # 加载主要模型和tokenizer（API 模式下跳过）
+        if not self._use_deepseek_api:
+            try:
+                model_path = self.config.get_model_path(self.model_name)
+                if model_path.exists() and list(model_path.iterdir()):
+                    logger.info(f"从本地路径加载模型: {model_path}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(model_path)
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        model_path, use_safetensors=True
+                    )
+                else:
+                    logger.info(f"从HuggingFace下载模型: {self.model_name}")
+                    self.tokenizer = AutoTokenizer.from_pretrained(self.model_name)
+                    self.model = AutoModelForCausalLM.from_pretrained(
+                        self.model_name, use_safetensors=True
+                    )
+                    model_path.mkdir(parents=True, exist_ok=True)
+                    self.model.save_pretrained(model_path, safe_serialization=True)
+                    self.tokenizer.save_pretrained(model_path)
+                self.model.to(self.device)
+                if self.tokenizer.pad_token is None:
+                    self.tokenizer.pad_token = self.tokenizer.eos_token
+            except Exception as e:
+                logger.error(f"加载主要模型失败: {e}")
+                raise
         
-        # 加载嵌入模型
+        # 加载嵌入模型（检索增强需要，API 模式也需加载）
         try:
             logger.info(f"正在加载嵌入模型: {self.embedding_model}")
             self.embedding_model_obj = SentenceTransformer(self.embedding_model)
@@ -208,8 +199,31 @@ class LocalVulnerabilityDetector:
         
         return results
     
+    def _generate_via_deepseek_api(self, prompt: str, max_new_tokens: int = 64) -> str:
+        """通过 DeepSeek API 生成预测"""
+        try:
+            from openai import OpenAI
+            client = OpenAI(
+                api_key=getattr(self.config, 'deepseek_api_key', ''),
+                base_url=getattr(self.config, 'deepseek_base_url', 'https://api.deepseek.com')
+            )
+            response = client.chat.completions.create(
+                model=getattr(self.config, 'deepseek_model', 'deepseek-chat'),
+                messages=[{"role": "user", "content": prompt}],
+                max_tokens=max_new_tokens,
+                temperature=0.1
+            )
+            text = (response.choices[0].message.content or "").strip()
+            return text
+        except Exception as e:
+            logger.error(f"DeepSeek API 调用失败: {e}")
+            self._write_error_log("deepseek_api_error", e)
+            return self._heuristic_response(prompt)
+
     def generate_prediction(self, prompt: str, max_new_tokens: int = 64) -> str:
-        """使用本地模型生成预测"""
+        """使用本地模型或 DeepSeek API 生成预测"""
+        if self._use_deepseek_api:
+            return self._generate_via_deepseek_api(prompt, max_new_tokens)
         try:
             if not hasattr(self.model, 'generate') or (getattr(self.model.config, 'model_type', '') in ['roberta', 'bert'] and not getattr(self.model.config, 'is_decoder', False)):
                 return self._heuristic_response(prompt)
