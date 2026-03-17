@@ -19,3 +19,7 @@ models/
 reveal_output.log
 readme.md
 概览.txt
+debug.py
+sj-tmp/cpg_tmp/
+GRACE_IMPLEMENTATION_NOTES.md
+WEB_DEPLOY.md
