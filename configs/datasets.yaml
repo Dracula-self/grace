@@ -1,0 +1,38 @@
+datasets:
+  devign:
+    hf_id: DetectVul/devign
+    splits:
+      - train
+      - validation
+      - test
+    field_candidates:
+      id: ["id", "_id", "idx"]
+      func: ["func", "function", "code"]
+      target: ["target", "label", "vul"]
+      project: ["project", "project_name"]
+      commit_id: ["commit_id", "commit", "hash"]
+  reveal:
+    hf_id: claudios/ReVeal
+    splits:
+      - train
+      - validation
+      - test
+    field_candidates:
+      id: ["id", "_id", "idx", "hash"]
+      func: ["functionSource", "func", "code", "source"]
+      target: ["label", "target", "vulnerable"]
+      project: ["project", "dataset"]
+      commit_id: ["commit_id", "commit"]
+  bigvul:
+    hf_id: bstee615/bigvul
+    splits:
+      - train
+      - validation
+      - test
+    field_candidates:
+      id: ["id", "_id", "idx"]
+      func: ["func_before", "func", "code"]
+      target: ["vul", "target", "label"]
+      project: ["project", "project_name"]
+      commit_id: ["commit_id", "commit", "hash"]
+
