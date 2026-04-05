@@ -1,0 +1,8 @@
+inference:
+  provider: openai_compatible
+  model_name: models/local-awq
+  base_url: http://127.0.0.1:8000/v1
+  api_key: EMPTY
+  temperature: 0.0
+  max_new_tokens: 64
+  timeout: 300
